@@ -106,7 +106,7 @@ if "wall" in (sys.argv[3] if len(sys.argv) > 3 else ""):   # wall: body parts th
         for p in sorted(Path(d).rglob("machined_body.stl")):
             m = _tm2.load(p, force="mesh")
             s = 1e3 if m.bounds[1][0] < 1.0 else 1.0               # to mm
-            pitch, r = 0.25, 1.5                                      # 3.0 mm wall = ball of radius 1.5
+            pitch, r = 0.5, 1.5            # 3.0 mm wall = ball of radius 1.5; 0.25 mm voxels went over 12 GB
             v = m.copy()
             v.apply_scale(s)
             vox = v.voxelized(pitch).fill()
