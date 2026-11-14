@@ -115,18 +115,37 @@ if "wall" in (sys.argv[3] if len(sys.argv) > 3 else ""):   # wall: body parts th
             core = e >= r                                             # centres of 1.5 mm balls inside
             opened = _nd.distance_transform_edt(~core) * pitch <= r   # union of those balls
             thin = A & ~opened                                        # not inside any 3 mm ball
-            lab, n = _nd.label(thin)
+            lab, nlab = _nd.label(thin)
             out = []
-            if n:
-                vols = _nd.sum(thin, lab, range(1, n + 1)) * pitch ** 3
+            if nlab:
+                vols = _nd.sum(thin, lab, range(1, nlab + 1)) * pitch ** 3
                 for i in np.argsort(-vols)[:8]:
                     idx = np.argwhere(lab == i + 1)
                     lo = vox.indices_to_points(idx.min(0))
                     hi = vox.indices_to_points(idx.max(0))
                     out.append({"mm3": round(float(vols[i]), 2), "max_half_mm": round(float(e[lab == i + 1].max()), 2),
                                 "box": [np.round(lo, 1).tolist(), np.round(hi, 1).tolist()]})
+            # Wall thickness straight across (the usual CAD wall check): a ray from each vertex
+            # inward along -normal to the opposite face. A WALL is < 3.0 mm with an opposing face
+            # (normals within 60 deg of opposite); a convex edge sends its ray inward far, so it
+            # is not counted. The ball test above counts both.
+            n = np.asarray(v.vertex_normals)
+            o = np.asarray(v.vertices) - n * 1e-3
+            loc, ri, ti = v.ray.intersects_location(o, -n, multiple_hits=False)
+            t = np.full(len(o), np.inf)
+            opp = np.zeros(len(o), bool)
+            t[ri] = np.linalg.norm(loc - o[ri], axis=1)
+            opp[ri] = (v.face_normals[ti] * n[ri]).sum(1) < -0.5
+            w = (t < 3.0) & opp
+            bins = {}
+            for q in np.round(np.asarray(v.vertices)[w] / 5.0) * 5.0:
+                k = tuple(q.tolist())
+                bins[k] = bins.get(k, 0) + 1
+            wall = {"wall_vertices": int(w.sum()), "of": len(o),
+                    "min_mm": round(float(t[w].min()), 2) if w.any() else None,
+                    "top5mm": sorted(bins.items(), key=lambda b: -b[1])[:6]}
             print("LAB wall", json.dumps({"seed": _seed2, "car": _n2[0] - 1, "thin_mm3": round(float(thin.sum() * pitch ** 3), 2),
-                                          "body_mm3": round(float(A.sum() * pitch ** 3), 1), "pieces": int(n), "top": out}), flush=True)
+                                          "body_mm3": round(float(A.sum() * pitch ** 3), 1), "ball_pieces": int(lab.max()), "ball_top": out, **wall}), flush=True)
         return _rm2(d, *a, **k)
     sc.shutil.rmtree = _rm_wall
 seed, n = int(sys.argv[1]), int(sys.argv[2])
