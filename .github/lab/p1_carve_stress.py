@@ -95,6 +95,40 @@ if "hash" in (sys.argv[3] if len(sys.argv) > 3 else ""):   # hash: a hash of eve
             print("LAB hash", json.dumps({"seed": _seed, "car": _n[0] - 1, "file": str(p.relative_to(d)), "sha": h}), flush=True)
         return _rm(d, *a, **k)
     sc.shutil.rmtree = _rm_hash
+if "wall" in (sys.argv[3] if len(sys.argv) > 3 else ""):   # wall: body parts thinner than 3.0 mm, before build_one deletes them
+    import shutil as _sh2
+    import trimesh as _tm2
+    from scipy import ndimage as _nd
+    _rm2, _seed2, _n2 = _sh2.rmtree, int(sys.argv[1]), [0]
+
+    def _rm_wall(d, *a, **k):
+        _n2[0] += 1
+        for p in sorted(Path(d).rglob("machined_body.stl")):
+            m = _tm2.load(p, force="mesh")
+            s = 1e3 if m.bounds[1][0] < 1.0 else 1.0               # to mm
+            pitch, r = 0.25, 1.5                                      # 3.0 mm wall = ball of radius 1.5
+            v = m.copy()
+            v.apply_scale(s)
+            vox = v.voxelized(pitch).fill()
+            A = vox.matrix
+            e = _nd.distance_transform_edt(A) * pitch                 # mm to the surface
+            core = e >= r                                             # centres of 1.5 mm balls inside
+            opened = _nd.distance_transform_edt(~core) * pitch <= r   # union of those balls
+            thin = A & ~opened                                        # not inside any 3 mm ball
+            lab, n = _nd.label(thin)
+            out = []
+            if n:
+                vols = _nd.sum(thin, lab, range(1, n + 1)) * pitch ** 3
+                for i in np.argsort(-vols)[:8]:
+                    idx = np.argwhere(lab == i + 1)
+                    lo = vox.indices_to_points(idx.min(0))
+                    hi = vox.indices_to_points(idx.max(0))
+                    out.append({"mm3": round(float(vols[i]), 2), "max_half_mm": round(float(e[lab == i + 1].max()), 2),
+                                "box": [np.round(lo, 1).tolist(), np.round(hi, 1).tolist()]})
+            print("LAB wall", json.dumps({"seed": _seed2, "car": _n2[0] - 1, "thin_mm3": round(float(thin.sum() * pitch ** 3), 2),
+                                          "body_mm3": round(float(A.sum() * pitch ** 3), 1), "pieces": int(n), "top": out}), flush=True)
+        return _rm2(d, *a, **k)
+    sc.shutil.rmtree = _rm_wall
 seed, n = int(sys.argv[1]), int(sys.argv[2])
 MODE = sys.argv[3] if len(sys.argv) > 3 else ""     # nocorner | nobars: switch off one 11-Nov cutter change
 if "nocorner" in MODE:                                # corner relief for every body (6b95197) off
