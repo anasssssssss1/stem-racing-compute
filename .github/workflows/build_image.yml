@@ -11,6 +11,7 @@ jobs:
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
+        with: { ref: reviewer-speedups }
       - uses: docker/login-action@v3
         with: {registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}"}
       - uses: docker/build-push-action@v6
