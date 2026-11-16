@@ -130,7 +130,7 @@ jobs:
                   s = json.load(open("out/r/summary.json"))
                   out["summary"] = s
                   wants_cfd = "--cfd" in r.get("args", [])    # build-only cars (no airflow) pass on a clean build
-              out["ok"] = out["ok"] and (bool(s.get("cfd_initial", {}).get("converged")) if wants_cfd else True)
+                  out["ok"] = out["ok"] and (bool(s.get("cfd_initial", {}).get("converged")) if wants_cfd else True)
                   if r.get("save_case"):                   # keep the finished case (for warm starts)
                       runs = sorted(glob.glob("/tmp/case/run") or glob.glob("code/part2-simulation/cfd_case_template/runs/*/"))
                       subprocess.run(f"cd '{runs[0]}' && tar --exclude='processor*' --exclude=logs --exclude=postProcessing -cf - . | gzip > {os.getcwd()}/case.tgz",
