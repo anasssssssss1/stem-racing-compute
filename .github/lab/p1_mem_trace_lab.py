@@ -78,7 +78,7 @@ import joints  # noqa: E402
 import legality  # noqa: E402
 import mesh_fairing  # noqa: E402
 for mod, names in ((assembly, ["build", "write_mass_report"]), (joints, ["make_all"]),
-                   (mesh_fairing, ["remesh_file"]), (legality, ["check"]),
+                   (mesh_fairing, ["remesh_file"]), (legality, ["check", "_visibility_checks", "_wing_checks", "_wheel_checks", "chamber_measures", "_tether_checks", "_halo_checks", "manufactured_checks", "ballast_checks", "_min_wall_mm", "t55_wall_fraction"]),
                    (run_car, ["build_car", "cfd_and_objective", "write_report"])):
     for n in names:
         wrap(mod, n)
