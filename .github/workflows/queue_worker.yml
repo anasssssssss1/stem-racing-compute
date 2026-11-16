@@ -2,17 +2,16 @@ name: queue worker
 # Pick now = Run workflow. Each matrix job asks the queue for ONE car when it starts, builds
 # and times it (half car, 4 cores, hierarchical split, 1000 iterations) and reports back.
 # Empty queue: the job ends in seconds. A solve that would pass GitHub's 6 h limit saves
-# itself and goes back to the queue to continue (Part 2 checkpoints). Needs the repository
-# secret QUEUE_KEY (given once by the reviewer).
+# itself and goes back to the queue to continue (Part 2 checkpoints). No secrets: each job
+# proves which account, run and workflow version it is with GitHub's signed OIDC token.
 on:
   workflow_dispatch:
     inputs:
       slots: { description: "Cars in this run (max 256)", default: "256" }
       parallel: { description: "Cars at once (20 free, 40 Pro)", default: "20" }
-permissions: { contents: write }      # to save cases/checkpoints as release files
+permissions: { contents: write, id-token: write }   # release files; GitHub-signed identity
 env:
-  QUEUE: http://139.185.60.30:8090/a/${{ github.repository_owner }}
-  QKEY: ${{ secrets.QUEUE_KEY }}
+  QUEUE: http://139.185.60.30:8090
   GH_TOKEN: ${{ github.token }}
   PY_DEPS: numpy==2.4.6 scipy==1.17.1 pandas trimesh==5.2.0 scikit-image shapely rtree==1.4.1 mapbox-earcut manifold3d==3.5.4 fast_simplification==0.2.0 jax jaxlib matplotlib pymeshlab==2025.7.post1
   OMPI_MCA_hwloc_base_use_hwthreads_as_cpus: "1"
@@ -38,8 +37,10 @@ jobs:
       - id: claim
         run: |
           echo "P2_JOB_DEADLINE=$(( $(date +%s) + 340*60 ))" >> "$GITHUB_ENV"
+          ID=$(curl -s -m 30 --retry 5 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+               "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=stem-queue" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")
           code=$(curl -s -m 60 --retry 5 --retry-all-errors -o job.json -w '%{http_code}' -X POST "$QUEUE/claim" \
-                 -H "X-Queue-Key: $QKEY" -d '{"run": "${{ github.run_id }}", "slot": ${{ matrix.slot }}}')
+                 -H "Authorization: Bearer $ID" -d '{"slot": ${{ matrix.slot }}}')
           echo "queue answered HTTP $code"; cat job.json; echo
           [ "$code" = 200 ] || { echo "go=0" >> "$GITHUB_OUTPUT"; exit 0; }
           python3 -c "import json; r=json.load(open('job.json'))['recipe']; print('go=1'); print('ref='+r['ref']); print('repo='+r.get('repo','anasssssssss1/stem-racing-compute'))" >> "$GITHUB_OUTPUT"
@@ -141,10 +142,14 @@ jobs:
           fd = sorted(glob.glob("out/r/**/force*.dat", recursive=True) + glob.glob("code/part2-simulation/cfd_case_template/runs/*/postProcessing/**/force*.dat", recursive=True) + glob.glob("/tmp/case/run/postProcessing/**/force*.dat", recursive=True))
           out["forces_file"] = fd[-1] if fd else None
           out["forces"] = open(fd[-1]).read() if fd else ""
-          req = urllib.request.Request(os.environ["QUEUE"] + "/result", json.dumps(out).encode(), method="POST",
-                                       headers={"X-Queue-Key": os.environ["QKEY"]})
+          def identity():      # a fresh GitHub-signed token (they expire in minutes)
+              q = urllib.request.Request(os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=stem-queue",
+                                         headers={"Authorization": "bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
+              return json.loads(urllib.request.urlopen(q, timeout=30).read())["value"]
           for _ in range(5):
               try:
+                  req = urllib.request.Request(os.environ["QUEUE"] + "/result", json.dumps(out).encode(), method="POST",
+                                               headers={"Authorization": "Bearer " + identity()})
                   print("reported", urllib.request.urlopen(req, timeout=120).status); break
               except Exception as e:
                   print("retry", e)
