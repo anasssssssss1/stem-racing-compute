@@ -1,26 +1,27 @@
 name: queue worker
-# One teammate click = one run. Each matrix job asks the queue for ONE car when it starts,
-# runs it (build + CFD, 4 cores, hierarchical split), and reports the result. If the queue
-# is empty the job ends in seconds. Paste the ticket from the job-queue page.
+# Pick now = Run workflow. Each matrix job asks the queue for ONE car when it starts, builds
+# and times it (4 cores, hierarchical split) and reports back. Empty queue: the job ends in
+# seconds. Needs the repository secret QUEUE_KEY (given once by the reviewer).
 on:
   workflow_dispatch:
     inputs:
-      ticket: { description: "Ticket URL from the job-queue page", required: true }
       slots: { description: "Cars in this run (max 256)", default: "256" }
       parallel: { description: "Cars at once (20 free, 40 Pro)", default: "20" }
 permissions: { contents: read }
 env:
+  QUEUE: http://139.185.60.30:8090/a/${{ github.repository_owner }}
+  QKEY: ${{ secrets.QUEUE_KEY }}
   PY_DEPS: numpy==2.4.6 scipy==1.17.1 pandas trimesh==5.2.0 scikit-image shapely rtree==1.4.1 mapbox-earcut manifold3d==3.5.4 fast_simplification==0.2.0 jax jaxlib matplotlib pymeshlab==2025.7.post1
   OMPI_MCA_hwloc_base_use_hwthreads_as_cpus: "1"
   OMPI_MCA_rmaps_base_oversubscribe: "1"
-  TICKET: ${{ inputs.ticket }}
 jobs:
   plan:
     runs-on: ubuntu-24.04
     outputs: { slots: "${{ steps.s.outputs.slots }}" }
     steps:
       - id: s
-        run: python3 -c "n=max(1,min(256,int('${{ inputs.slots }}'))); print('slots=' + str(list(range(1,n+1))))" >> "$GITHUB_OUTPUT"
+        env: { N: "${{ inputs.slots }}" }
+        run: python3 -c "import os; n=max(1,min(256,int(os.environ['N']))); print('slots='+str(list(range(1,n+1))))" >> "$GITHUB_OUTPUT"
   car:
     needs: plan
     name: slot ${{ matrix.slot }}
@@ -33,12 +34,14 @@ jobs:
     steps:
       - id: claim
         run: |
-          code=$(curl -s -o job.json -w '%{http_code}' -X POST "$TICKET/claim" -d '{"slot": ${{ matrix.slot }}}')
-          echo "HTTP $code"; [ "$code" = 200 ] || { echo "go=0" >> "$GITHUB_OUTPUT"; exit 0; }
-          python3 -c "import json; j=json.load(open('job.json')); print('go=1'); print('id='+j['id']); print('ref='+j['recipe']['ref'])" >> "$GITHUB_OUTPUT"
+          code=$(curl -s -m 60 --retry 5 --retry-all-errors -o job.json -w '%{http_code}' -X POST "$QUEUE/claim" \
+                 -H "X-Queue-Key: $QKEY" -d '{"run": "${{ github.run_id }}", "slot": ${{ matrix.slot }}}')
+          echo "queue answered HTTP $code"; cat job.json; echo
+          [ "$code" = 200 ] || { echo "go=0" >> "$GITHUB_OUTPUT"; exit 0; }
+          python3 -c "import json; r=json.load(open('job.json'))['recipe']; print('go=1'); print('ref='+r['ref']); print('repo='+r.get('repo','anasssssssss1/stem-racing-compute'))" >> "$GITHUB_OUTPUT"
       - if: steps.claim.outputs.go == '1'
         uses: actions/checkout@v4
-        with: { repository: "${{ github.repository }}", ref: "${{ steps.claim.outputs.ref }}", path: code }
+        with: { repository: "${{ steps.claim.outputs.repo }}", ref: "${{ steps.claim.outputs.ref }}", path: code }
       - if: steps.claim.outputs.go == '1'
         uses: actions/setup-python@v5
         with: { python-version: "3.11" }
@@ -56,7 +59,7 @@ jobs:
         run: |
           start=$(date +%s)
           # args come from the queue as a JSON list, passed straight to run_car.py (no shell)
-          python -W ignore -c "import json,subprocess,sys; a=json.load(open('../../job.json'))['recipe']['args']; sys.exit(subprocess.call([sys.executable,'-W','ignore','run_car.py','--out','../../out/r']+a))"
+          python -c "import json,subprocess,sys; a=json.load(open('../../job.json'))['recipe']['args']; sys.exit(subprocess.call([sys.executable,'-W','ignore','run_car.py','--out','../../out/r']+a))"
           echo "minutes=$(( ($(date +%s) - start) / 60 ))" >> "$GITHUB_OUTPUT"
       - if: always() && steps.claim.outputs.go == '1'
         env:
@@ -65,25 +68,26 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python3 - <<'PY'
-          import glob, hashlib, json, os, platform, subprocess, urllib.request
+          import glob, hashlib, json, os, subprocess, urllib.request
           job = json.load(open("job.json"))
           out = {"id": job["id"], "ok": os.environ["OK"] == "true", "minutes": os.environ.get("MIN"),
-                 "run": os.environ["RUN_URL"], "cpu": subprocess.getoutput("lscpu | grep 'Model name'")}
+                 "run": os.environ["RUN_URL"], "cpu": subprocess.getoutput("lscpu | grep 'Model name' | sed 's/.*: *//'")}
           try:
               s = json.load(open("out/r/summary.json"))
               out["summary"] = s
               out["ok"] = out["ok"] and bool(s.get("cfd_initial", {}).get("converged"))
           except Exception as e:
               out["ok"], out["error"] = False, repr(e)
-          for f in ("out/r/body_half.stl",):
-              if os.path.exists(f):
-                  out["body_sha256"] = hashlib.sha256(open(f, "rb").read()).hexdigest()
+          if os.path.exists("out/r/body_half.stl"):
+              out["body_sha256"] = hashlib.sha256(open("out/r/body_half.stl", "rb").read()).hexdigest()
           fd = sorted(glob.glob("out/r/**/force*.dat", recursive=True))
+          out["forces_file"] = fd[-1] if fd else None
           out["forces"] = open(fd[-1]).read() if fd else ""
-          req = urllib.request.Request(os.environ["TICKET"] + "/result", json.dumps(out).encode(), method="POST")
+          req = urllib.request.Request(os.environ["QUEUE"] + "/result", json.dumps(out).encode(), method="POST",
+                                       headers={"X-Queue-Key": os.environ["QKEY"]})
           for _ in range(5):
               try:
-                  print("report", urllib.request.urlopen(req, timeout=60).status); break
+                  print("reported", urllib.request.urlopen(req, timeout=60).status); break
               except Exception as e:
                   print("retry", e)
           PY
