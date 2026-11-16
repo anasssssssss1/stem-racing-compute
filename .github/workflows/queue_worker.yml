@@ -1,16 +1,19 @@
 name: queue worker
 # Pick now = Run workflow. Each matrix job asks the queue for ONE car when it starts, builds
-# and times it (4 cores, hierarchical split) and reports back. Empty queue: the job ends in
-# seconds. Needs the repository secret QUEUE_KEY (given once by the reviewer).
+# and times it (half car, 4 cores, hierarchical split, 1000 iterations) and reports back.
+# Empty queue: the job ends in seconds. A solve that would pass GitHub's 6 h limit saves
+# itself and goes back to the queue to continue (Part 2 checkpoints). Needs the repository
+# secret QUEUE_KEY (given once by the reviewer).
 on:
   workflow_dispatch:
     inputs:
       slots: { description: "Cars in this run (max 256)", default: "256" }
       parallel: { description: "Cars at once (20 free, 40 Pro)", default: "20" }
-permissions: { contents: read }
+permissions: { contents: write }      # to save cases/checkpoints as release files
 env:
   QUEUE: http://139.185.60.30:8090/a/${{ github.repository_owner }}
   QKEY: ${{ secrets.QUEUE_KEY }}
+  GH_TOKEN: ${{ github.token }}
   PY_DEPS: numpy==2.4.6 scipy==1.17.1 pandas trimesh==5.2.0 scikit-image shapely rtree==1.4.1 mapbox-earcut manifold3d==3.5.4 fast_simplification==0.2.0 jax jaxlib matplotlib pymeshlab==2025.7.post1
   OMPI_MCA_hwloc_base_use_hwthreads_as_cpus: "1"
   OMPI_MCA_rmaps_base_oversubscribe: "1"
@@ -26,7 +29,7 @@ jobs:
     needs: plan
     name: slot ${{ matrix.slot }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 355
+    timeout-minutes: 358
     strategy:
       fail-fast: false
       max-parallel: ${{ fromJSON(inputs.parallel) }}
@@ -34,6 +37,7 @@ jobs:
     steps:
       - id: claim
         run: |
+          echo "P2_JOB_DEADLINE=$(( $(date +%s) + 340*60 ))" >> "$GITHUB_ENV"
           code=$(curl -s -m 60 --retry 5 --retry-all-errors -o job.json -w '%{http_code}' -X POST "$QUEUE/claim" \
                  -H "X-Queue-Key: $QKEY" -d '{"run": "${{ github.run_id }}", "slot": ${{ matrix.slot }}}')
           echo "queue answered HTTP $code"; cat job.json; echo
@@ -54,40 +58,95 @@ jobs:
           sudo apt-get install -y -q openfoam2412-default
           pip install $PY_DEPS
       - if: steps.claim.outputs.go == '1'
+        name: Files the car needs (reference cases, a saved link to continue)
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess, urllib.request
+          r = json.load(open("job.json"))["recipe"]
+          need = list(r.get("fetch", []))
+          if r.get("resume_url"):
+              need.append({"url": r["resume_url"], "to": "/tmp/case"})
+          for f in need:
+              p = "/tmp/dl_" + hashlib.sha1(f["url"].encode()).hexdigest()
+              urllib.request.urlretrieve(f["url"], p)
+              if f.get("sha256"):
+                  got = hashlib.sha256(open(p, "rb").read()).hexdigest()
+                  assert got.startswith(f["sha256"]), f"sha256 mismatch for {f['url']}: {got}"
+              os.makedirs(f["to"], exist_ok=True)
+              if f["url"].endswith(".zip"):
+                  subprocess.run(["unzip", "-q", p, "-d", f["to"]], check=True)
+              else:
+                  subprocess.run(["tar", "-xf", p, "-C", f["to"]], check=True)
+              os.remove(p)
+              print("fetched", f["url"], "->", f["to"])
+          PY
+          [ -d /tmp/case/run ] && echo "P2_RESUME_CASE=/tmp/case/run" >> "$GITHUB_ENV" || true
+      - if: steps.claim.outputs.go == '1'
         id: run
         working-directory: code/part5-simulation
         run: |
           start=$(date +%s)
+          export P2_CHECKPOINT_FILE=$GITHUB_WORKSPACE/ckpt_path.txt
           # args come from the queue as a JSON list, passed straight to run_car.py (no shell)
+          set +e
           python -c "import json,subprocess,sys; a=json.load(open('../../job.json'))['recipe']['args']; sys.exit(subprocess.call([sys.executable,'-W','ignore','run_car.py','--out','../../out/r']+a))"
+          rc=$?
           echo "minutes=$(( ($(date +%s) - start) / 60 ))" >> "$GITHUB_OUTPUT"
+          [ -f "$P2_CHECKPOINT_FILE" ] && { echo "checkpoint=1" >> "$GITHUB_OUTPUT"; exit 0; }
+          exit $rc
       - if: always() && steps.claim.outputs.go == '1'
+        name: Save files and report to the queue
         env:
           OK: ${{ steps.run.outcome == 'success' }}
           MIN: ${{ steps.run.outputs.minutes }}
+          CKPT: ${{ steps.run.outputs.checkpoint }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPO: ${{ github.repository }}
         run: |
           python3 - <<'PY'
           import glob, hashlib, json, os, subprocess, urllib.request
-          job = json.load(open("job.json"))
-          out = {"id": job["id"], "ok": os.environ["OK"] == "true", "minutes": os.environ.get("MIN"),
+          job = json.load(open("job.json")); r = job["recipe"]; jid = job["id"]
+          def release_file(path, name):
+              """Save a big file as a public release asset of this repo; return its URL."""
+              # create once; several jobs may race here, so a failed create is fine if it exists now
+              subprocess.run(["gh", "release", "create", "queue-files", "-R", os.environ["REPO"], "--title", "Queue files",
+                              "--notes", "Saved CFD cases and checkpoints from the job queue."], capture_output=True)
+              os.rename(path, name)
+              subprocess.run(["gh", "release", "upload", "queue-files", name, "--clobber", "-R", os.environ["REPO"]], check=True)
+              return f"https://github.com/{os.environ['REPO']}/releases/download/queue-files/{name}"
+          out = {"id": jid, "ok": os.environ["OK"] == "true", "minutes": os.environ.get("MIN"),
                  "run": os.environ["RUN_URL"], "cpu": subprocess.getoutput("lscpu | grep 'Model name' | sed 's/.*: *//'")}
+          ck = os.environ.get("GITHUB_WORKSPACE", ".") + "/ckpt_path.txt"
           try:
-              s = json.load(open("out/r/summary.json"))
-              out["summary"] = s
-              out["ok"] = out["ok"] and bool(s.get("cfd_initial", {}).get("converged"))
+              if os.environ.get("CKPT") == "1":           # solve saved at the time limit: continue later
+                  run = open(ck).read().strip()
+                  link = int(r.get("link", 1))
+                  subprocess.run(["tar", "-cf", "case.tar", "-C", os.path.dirname(run),
+                                  "--transform", f"s|^{os.path.basename(run)}|run|", os.path.basename(run)], check=True)
+                  out["checkpoint_url"] = release_file("case.tar", f"{jid}-link{link}.tar")
+                  out["ok"] = False
+              else:
+                  s = json.load(open("out/r/summary.json"))
+                  out["summary"] = s
+                  out["ok"] = out["ok"] and bool(s.get("cfd_initial", {}).get("converged"))
+                  if r.get("save_case"):                   # keep the finished case (for warm starts)
+                      runs = sorted(glob.glob("/tmp/case/run") or glob.glob("code/part2-simulation/cfd_case_template/runs/*/"))
+                      subprocess.run(f"cd '{runs[0]}' && tar --exclude='processor*' --exclude=logs --exclude=postProcessing -cf - . | gzip > {os.getcwd()}/case.tgz",
+                                     shell=True, check=True)
+                      out["case_url"] = release_file("case.tgz", f"{jid}-case.tgz")
           except Exception as e:
               out["ok"], out["error"] = False, repr(e)
           if os.path.exists("out/r/body_half.stl"):
               out["body_sha256"] = hashlib.sha256(open("out/r/body_half.stl", "rb").read()).hexdigest()
-          fd = sorted(glob.glob("out/r/**/force*.dat", recursive=True))
+          fd = sorted(glob.glob("out/r/**/force*.dat", recursive=True) + glob.glob("code/part2-simulation/cfd_case_template/runs/*/postProcessing/**/force*.dat", recursive=True) + glob.glob("/tmp/case/run/postProcessing/**/force*.dat", recursive=True))
           out["forces_file"] = fd[-1] if fd else None
           out["forces"] = open(fd[-1]).read() if fd else ""
           req = urllib.request.Request(os.environ["QUEUE"] + "/result", json.dumps(out).encode(), method="POST",
                                        headers={"X-Queue-Key": os.environ["QKEY"]})
           for _ in range(5):
               try:
-                  print("reported", urllib.request.urlopen(req, timeout=60).status); break
+                  print("reported", urllib.request.urlopen(req, timeout=120).status); break
               except Exception as e:
                   print("retry", e)
+          print({k: v for k, v in out.items() if k not in ("forces", "summary")})
           PY
